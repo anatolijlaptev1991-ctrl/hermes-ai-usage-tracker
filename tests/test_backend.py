@@ -4,6 +4,8 @@ import importlib.util
 import unittest
 from pathlib import Path
 
+import agent.account_usage as core_account_usage
+
 REPO = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("ai_usage_tracker_api_under_test", REPO / "dashboard" / "plugin_api.py")
 assert SPEC and SPEC.loader
@@ -41,6 +43,22 @@ class QuotaParserTests(unittest.TestCase):
         self.assertEqual(result["windows"][0]["remaining_percent"], 99.0)
         self.assertEqual(result["windows"][1]["remaining_percent"], 18.0)
         self.assertIn("T", result["windows"][0]["reset_at"])
+
+    def test_anthropic_utilization_is_already_a_percentage(self) -> None:
+        payload = {
+            "five_hour": {"utilization": 1.0, "resets_at": "2026-11-09T01:59:59Z"},
+            "seven_day": {"utilization": 0.5, "resets_at": "2026-11-15T00:59:59Z"},
+        }
+        self.stub_payload(payload)
+        api._runtime_key = lambda _provider: "sk-ant-oat01-test-only"
+        # The pre-fix plugin delegated to Hermes' parser; stub that boundary too
+        # so this test reproduces the original 1% -> 100% failure exactly.
+        core_account_usage._get_json = lambda *_args, **_kwargs: payload
+        result = api._PROBES["anthropic"]()
+        self.assertTrue(result["available"])
+        self.assertEqual([row["label"] for row in result["windows"]], ["Current session", "Current week"])
+        self.assertEqual([row["used_percent"] for row in result["windows"]], [1.0, 0.5])
+        self.assertEqual([row["remaining_percent"] for row in result["windows"]], [99.0, 99.5])
 
     def test_kimi_modern_usages_and_monthly_windows(self) -> None:
         self.stub_payload({

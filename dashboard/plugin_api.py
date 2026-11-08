@@ -324,17 +324,50 @@ def _serialize_snapshot(snapshot: Any) -> dict[str, Any]:
     }
 
 
+def _probe_anthropic() -> dict[str, Any]:
+    key = _runtime_key("anthropic")
+    if not key:
+        return _unavailable("No Claude Code OAuth credentials in this profile.", source="oauth_usage_api")
+    if key.startswith("sk-ant-api"):
+        return _unavailable("Anthropic account limits are only available for OAuth-backed Claude accounts.",
+                            source="oauth_usage_api")
+    headers = {
+        "Authorization": f"Bearer {key}", "Accept": "application/json", "Content-Type": "application/json",
+        "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-code/2.1.0",
+    }
+    try:
+        payload = _get_json("https://api.anthropic.com/api/oauth/usage", headers)
+    except Exception as exc:  # noqa: BLE001
+        return _unavailable(f"Anthropic quota probe failed: {type(exc).__name__}: {exc}", source="oauth_usage_api")
+
+    # Anthropic's OAuth endpoint returns utilization as 0..100 percent already.
+    # Hermes' shared parser historically scales values <=1 by 100, turning a
+    # real 1% session into 100%. Parse verbatim here so low usage stays low.
+    windows: list[dict[str, Any]] = []
+    for field, label in (("five_hour", "Current session"), ("seven_day", "Current week"),
+                         ("seven_day_opus", "Opus week"), ("seven_day_sonnet", "Sonnet week")):
+        row = payload.get(field)
+        if not isinstance(row, dict) or not isinstance(row.get("utilization"), (int, float)):
+            continue
+        windows.append(_window(label, float(row["utilization"]), row.get("resets_at")))
+    if not windows:
+        return _unavailable("No credentials for this provider in this profile, or its quota probe failed.",
+                            source="oauth_usage_api")
+
+    details: list[str] = []
+    extra = payload.get("extra_usage") or {}
+    used_credits, monthly_limit = extra.get("used_credits"), extra.get("monthly_limit")
+    if extra.get("is_enabled") and isinstance(used_credits, (int, float)) and isinstance(monthly_limit, (int, float)):
+        details.append(f"Extra usage: {used_credits:.2f} / {monthly_limit:.2f} {extra.get('currency') or 'USD'}")
+    return {"available": True, "source": "oauth_usage_api", "title": "Account limits", "plan": None,
+            "windows": windows, "details": details, "unavailable_reason": None,
+            "fetched_at": datetime.now(timezone.utc).isoformat()}
+
+
 def _probe_standard(provider: str) -> dict[str, Any]:
     from agent.account_usage import fetch_account_usage
 
-    # Hosted plugin workers do not inherit the gateway's full secret scope.
-    # Resolve Anthropic OAuth in the bound profile and pass it explicitly;
-    # otherwise fetch_account_usage() can mistake the worker's empty ambient
-    # scope for a signed-out account even though the profile is configured.
-    api_key = _runtime_key("anthropic") if provider == "anthropic" else None
-    if provider == "anthropic" and not api_key:
-        return _unavailable("No Claude Code OAuth credentials in this profile.", source="oauth_usage_api")
-    snapshot = fetch_account_usage(provider, api_key=api_key) if api_key else fetch_account_usage(provider)
+    snapshot = fetch_account_usage(provider)
     if snapshot is None:
         return _unavailable("No credentials for this provider in this profile, or its quota probe failed.",
                             source="usage_api")
@@ -686,7 +719,7 @@ def _probe_deepseek() -> dict[str, Any]:
 
 
 _PROBES: dict[str, Callable[[], dict[str, Any]]] = {
-    "anthropic": lambda: _probe_standard("anthropic"),
+    "anthropic": _probe_anthropic,
     "openai-codex": lambda: _probe_standard("openai-codex"),
     "openrouter": lambda: _probe_standard("openrouter"),
     "nous": _probe_nous,
