@@ -7,6 +7,27 @@ window, and a per-profile picker.
 Scope is deliberately narrow: **quota windows only** — provider, plan, window name,
 % remaining, reset countdown. No token counting, no cost estimates, no period filters.
 
+## Languages
+
+The desktop UI automatically follows Hermes' `display.language` through the plugin SDK's
+`ctx.i18n.register(...)` and `usePluginI18n(...)`. It ships complete bundles for every
+language bundled with Hermes:
+
+- English (`en`)
+- Russian / Русский (`ru`)
+- German / Deutsch (`de`)
+- Spanish / Español (`es`)
+- French / Français (`fr`)
+- Japanese / 日本語 (`ja`)
+- Arabic / العربية (`ar`)
+- Simplified Chinese / 简体中文 (`zh`)
+- Traditional Chinese / 繁體中文 (`zh-hant`)
+
+Sidebar labels, controls, quota windows, reset times, provider details, status text and
+common errors are localized. Provider names and technical identifiers stay unchanged.
+A language unknown to the plugin falls back to English; switching Hermes' language updates
+the page, chip and sidebar without reinstalling the plugin.
+
 | Provider | Live quota endpoint |
 | --- | --- |
 | `openai-codex` | `chatgpt.com/backend-api/wham/usage` (session + weekly windows) |
@@ -31,14 +52,14 @@ browser cookies and are deliberately not attempted.
 # from the curated catalog (once merged):
 hermes plugins install ai-usage-tracker --enable
 
-# from this repo directly:
-hermes plugins install <owner>/<repo> --enable
+# install this multilingual fork directly:
+hermes plugins install anatolijlaptev1991-ctrl/hermes-ai-usage-tracker --enable
 ```
 
 Or ship an install link in any README/site:
 
 ```html
-<a href="hermes://plugin/install?repo=<owner>/<repo>&enable=1">Install in Hermes</a>
+<a href="hermes://plugin/install?repo=anatolijlaptev1991-ctrl/hermes-ai-usage-tracker&enable=1">Install in Hermes</a>
 ```
 
 Then enable it **for each profile** you want it in — desktop backends are profile-scoped,
@@ -57,8 +78,8 @@ Relaunch the desktop app after enabling (backend routes mount at web-server star
 
 The header picker lists **every profile on this machine** and probes the selected one:
 ``GET /usage?profile=<name>`` runs the quota probes with that profile's `HERMES_HOME`
-bound through `hermes_constants`' context-local override, so credentials, `auth.json`
-and `.env` resolve for that profile — not the server's own. The chip follows the same
+and credential scope bound in every worker thread, so API keys, OAuth, `auth.json` and
+`.env` resolve for that profile — not the server's own. The chip follows the same
 selection, and the choice is persisted plugin-scoped.
 
 Honest limits:
@@ -92,6 +113,25 @@ ai-usage-tracker/
 
 Endpoints: `GET /usage?profile=<name>&refresh=0|1`, `GET /profiles`, `GET /health`.
 Responses are cached in-process for 60s per profile; `refresh=1` bypasses.
+
+## Verification
+
+```bash
+# JavaScript syntax + all nine locale bundles, key parity, interpolation and fallbacks
+node --input-type=module --check < desktop/plugin.js
+node tests/test_i18n.cjs
+
+# Parser regressions (run with Hermes' Python environment; no network or credentials)
+python tests/test_backend.py
+
+# Hermes manifest/runtime checks (with hermes on PATH)
+hermes plugins validate .
+hermes plugins doctor ai-usage-tracker
+```
+
+The i18n test asserts the exact Hermes locale set, 110 keys per locale, no accidentally
+untranslated English leaves, working interpolation, the Russian regression cases and the
+canonical plugin id.
 
 ## Privacy
 

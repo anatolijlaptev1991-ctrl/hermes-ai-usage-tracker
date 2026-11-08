@@ -93,12 +93,12 @@ _ENV_HINTS = {
 
 
 def _run_in_home(home: Optional[Path], fn: Callable[[], Any]) -> Any:
-    """Run ``fn`` with ``home`` bound as this thread's Hermes home.
+    """Run ``fn`` with ``home`` and its credentials bound in this thread.
 
-    The override lives in a ContextVar, so it is thread-local: a request can
-    resolve another profile's credentials/state without disturbing the server's
-    own profile (and ThreadPoolExecutor workers do NOT inherit the caller's
-    context, so every worker binds it itself).
+    Both overrides live in ContextVars. ThreadPoolExecutor workers inherit
+    neither the request's home nor its multiplexed secret scope, so binding
+    only HERMES_HOME is not enough: OAuth resolvers then fail closed even for
+    a configured profile (notably Claude Code).
     """
     if home is None:
         return fn()
@@ -107,9 +107,21 @@ def _run_in_home(home: Optional[Path], fn: Callable[[], Any]) -> Any:
     except Exception:  # noqa: BLE001
         return fn()
     token = set_hermes_home_override(home)
+    secret_token = None
     try:
+        try:
+            from agent.secret_scope import (
+                build_profile_secret_scope,
+                reset_secret_scope,
+                set_secret_scope,
+            )
+            secret_token = set_secret_scope(build_profile_secret_scope(home), profile_home=str(home))
+        except Exception:  # noqa: BLE001 - classic single-profile installs need no secret scope
+            log.debug("profile secret scope unavailable for %s", home, exc_info=True)
         return fn()
     finally:
+        if secret_token is not None:
+            reset_secret_scope(secret_token)
         reset_hermes_home_override(token)
 
 
@@ -315,9 +327,17 @@ def _serialize_snapshot(snapshot: Any) -> dict[str, Any]:
 def _probe_standard(provider: str) -> dict[str, Any]:
     from agent.account_usage import fetch_account_usage
 
-    snapshot = fetch_account_usage(provider)
+    # Hosted plugin workers do not inherit the gateway's full secret scope.
+    # Resolve Anthropic OAuth in the bound profile and pass it explicitly;
+    # otherwise fetch_account_usage() can mistake the worker's empty ambient
+    # scope for a signed-out account even though the profile is configured.
+    api_key = _runtime_key("anthropic") if provider == "anthropic" else None
+    if provider == "anthropic" and not api_key:
+        return _unavailable("No Claude Code OAuth credentials in this profile.", source="oauth_usage_api")
+    snapshot = fetch_account_usage(provider, api_key=api_key) if api_key else fetch_account_usage(provider)
     if snapshot is None:
-        return _unavailable("No credentials for this provider in this profile.", source="usage_api")
+        return _unavailable("No credentials for this provider in this profile, or its quota probe failed.",
+                            source="usage_api")
     return _serialize_snapshot(snapshot)
 
 
@@ -474,7 +494,10 @@ def _probe_zai() -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         return _unavailable(f"Z.AI quota probe failed: {type(exc).__name__}: {exc}", source="zai_quota")
     windows: list[dict[str, Any]] = []
-    for item in payload.get("limits") or []:
+    # Current Z.AI wraps the quota response in ``data``; older deployments
+    # returned the same fields at the top level.
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    for item in data.get("limits") or []:
         if not isinstance(item, dict):
             continue
         kind = str(item.get("type") or "").upper()
@@ -484,23 +507,38 @@ def _probe_zai() -> dict[str, Any]:
             base = total or usage_value
             if base:
                 percent = float(current) / float(base) * 100.0
-        if kind == "TOKENS_LIMIT":
-            label = "Session (5h)"
-        elif kind == "TIME_LIMIT":
+        unit = item.get("unit")
+        number = item.get("number")
+        if kind == "TIME_LIMIT":
             label = "Tool quota"
-        elif item.get("unit") == 6:
+        elif unit == 6:
+            # Weekly token/credit buckets are still weekly regardless of their
+            # payload type. Check this before TOKENS_LIMIT's session fallback.
             label = "Weekly"
+        elif kind == "TOKENS_LIMIT" or (kind == "CREDIT_LIMIT" and unit == 3):
+            label = f"Session ({number:g}h)" if isinstance(number, (int, float)) else "Session"
         else:
             label = kind.replace("_", " ").title() or "Limit"
         remaining = item.get("remaining")
-        window = _window(label, percent, None, f"{remaining} left" if remaining is not None else None)
+        detail = None
+        if isinstance(remaining, (int, float)) and isinstance(usage_value, (int, float)):
+            detail = f"{remaining:g} of {usage_value:g} left"
+        elif remaining is not None:
+            detail = f"{remaining} left"
+        reset_at = item.get("nextResetTime") or item.get("resetTime") or item.get("reset_time")
+        if isinstance(reset_at, (int, float)):
+            # Z.AI currently sends epoch milliseconds; accept seconds too.
+            reset_at = datetime.fromtimestamp(reset_at / (1000.0 if reset_at > 10_000_000_000 else 1.0),
+                                              tz=timezone.utc).isoformat()
+        window = _window(label, percent, reset_at, detail)
         if window["used_percent"] is not None:
             windows.append(window)
     if not windows:
         return _unavailable("Z.AI returned no parseable quota limits.", source="zai_quota")
-    return {"available": True, "source": "zai_quota", "title": "Z.AI coding plan limits", "plan": None,
-            "windows": windows, "details": [], "unavailable_reason": None,
-            "fetched_at": datetime.now(timezone.utc).isoformat()}
+    level = data.get("level")
+    return {"available": True, "source": "zai_quota", "title": "Z.AI coding plan limits",
+            "plan": str(level) if level else None, "windows": windows, "details": [],
+            "unavailable_reason": None, "fetched_at": datetime.now(timezone.utc).isoformat()}
 
 
 def _probe_kimi() -> dict[str, Any]:
@@ -530,11 +568,57 @@ def _probe_kimi() -> dict[str, Any]:
     if used is not None and limit:
         windows.append(_window("Weekly", used / limit * 100.0, usage.get("resetTime"),
                                f"{max(0.0, limit - used):g} of {limit:g} left"))
-    for entry in payload.get("limits") or []:
-        if isinstance(entry, dict) and entry.get("percentage") is not None:
-            windows.append(_window(str(entry.get("window") or entry.get("name") or "Limit"),
-                                   float(entry["percentage"]),
+
+    # Kimi Coding's current endpoint uses ``usages`` (plural), with ratios in
+    # the 0..1 range and separate monthly windows. Keep the legacy parser above.
+    usage_labels = {
+        "limit_5h": "Session (5h)",
+        "limit_week": "Weekly",
+        "limit_week_total": "Weekly total",
+        "limit_week_code": "Weekly coding",
+        "limit_month": "Monthly",
+        "limit_month_total": "Monthly total",
+        "limit_month_code": "Monthly coding",
+    }
+    modern_usages = payload.get("usages") or {}
+    for key, entry in modern_usages.items():
+        if not isinstance(entry, dict):
+            continue
+        ratio = _num(entry.get("used_ratio"))
+        if ratio is None:
+            entry_used, entry_limit = _num(entry.get("used")), _num(entry.get("limit"))
+            if entry_used is not None and entry_limit:
+                ratio = entry_used / entry_limit * 100.0
+        elif 0.0 <= ratio <= 1.0:
+            ratio *= 100.0
+        if ratio is not None:
+            windows.append(_window(usage_labels.get(key, key.replace("limit_", "").replace("_", " ").title()),
+                                   ratio, entry.get("reset_time") or entry.get("resetTime")))
+
+    # Older/alternate Kimi responses expose the same windows under ``limits``.
+    # Do not duplicate the richer ``usages`` rows when both forms are present.
+    limits = [] if modern_usages and windows else payload.get("limits") or []
+    for entry in limits:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("percentage") is not None:
+            raw_window = entry.get("window")
+            if isinstance(raw_window, dict):
+                duration = raw_window.get("duration")
+                unit = str(raw_window.get("timeUnit") or "")
+                label = f"{duration} min" if duration is not None and "MINUTE" in unit else "Limit"
+            else:
+                label = str(raw_window or entry.get("name") or "Limit")
+            windows.append(_window(label, float(entry["percentage"]),
                                    entry.get("resetTime") or entry.get("reset_time")))
+        elif not windows and isinstance(entry.get("detail"), dict):
+            detail = entry["detail"]
+            entry_used, entry_limit = _num(detail.get("used")), _num(detail.get("limit"))
+            if entry_used is not None and entry_limit:
+                remaining = _num(detail.get("remaining"))
+                text = f"{remaining:g} of {entry_limit:g} left" if remaining is not None else None
+                windows.append(_window("Limit", entry_used / entry_limit * 100.0,
+                                       detail.get("resetTime") or detail.get("reset_time"), text))
     if not windows:
         return _unavailable("Kimi returned no parseable usage windows.", source="kimi_usages")
     return {"available": True, "source": "kimi_usages", "title": "Kimi coding plan limits", "plan": None,
