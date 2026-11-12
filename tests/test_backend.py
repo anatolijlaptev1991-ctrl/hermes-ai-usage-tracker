@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import subprocess
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import agent.account_usage as core_account_usage
 
@@ -84,6 +87,34 @@ class QuotaParserTests(unittest.TestCase):
         result = api._probe_kimi()
         self.assertEqual(len(result["windows"]), 1)
         self.assertEqual(result["windows"][0]["label"], "Session (5h)")
+
+
+class QwenCloudTokenPlanProbeTests(unittest.TestCase):
+    def test_monthly_quota_fraction_is_converted_to_percent(self) -> None:
+        payload = {
+            "available": True, "source": "qwencloud_console", "title": "QwenCloud Token Plan",
+            "plan": "pro",
+            "windows": [{"label": "Monthly", "used_percent": 0.3,
+                         "reset_at": "2026-12-12T16:00:00+00:00",
+                         "detail": "199,400 of 200,000 credits left"}],
+            "details": [],
+        }
+        fake = subprocess.CompletedProcess(args=[], returncode=0, stdout=json.dumps(payload), stderr="")
+        with patch.object(api.subprocess, "run", return_value=fake):
+            result = api._probe_qwencloud_token_plan()
+        self.assertTrue(result["available"])
+        self.assertEqual(result["plan"], "pro")
+        self.assertEqual(result["windows"][0]["label"], "Monthly")
+        self.assertAlmostEqual(result["windows"][0]["used_percent"], 0.3)
+        self.assertAlmostEqual(result["windows"][0]["remaining_percent"], 99.7)
+
+    def test_expired_browser_session_is_unavailable(self) -> None:
+        payload = {"available": False, "reason": "QwenCloud browser session expired. Run qwencloud_login.py again."}
+        fake = subprocess.CompletedProcess(args=[], returncode=0, stdout=json.dumps(payload), stderr="")
+        with patch.object(api.subprocess, "run", return_value=fake):
+            result = api._probe_qwencloud_token_plan()
+        self.assertFalse(result["available"])
+        self.assertIn("expired", result["unavailable_reason"])
 
 
 if __name__ == "__main__":

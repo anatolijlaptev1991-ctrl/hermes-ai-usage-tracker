@@ -16,9 +16,12 @@ own. Secrets are resolved in-process and never serialized: the wire carries
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -64,6 +67,7 @@ _FALLBACK_LABELS = {
 _QUOTA_CAPABLE = frozenset({
     "anthropic", "openai-codex", "openrouter", "nous", "copilot",
     "opencode-go", "opencode-zen", "zai", "kimi-coding", "minimax", "deepseek",
+    "alibaba-token-plan", "alibaba-token-plan-cn",
 })
 
 _ENV_HINTS = {
@@ -82,6 +86,8 @@ _ENV_HINTS = {
     "kilocode": "KILOCODE_API_KEY",
     "huggingface": "HF_TOKEN",
     "alibaba": "DASHSCOPE_API_KEY",
+    "alibaba-token-plan": "ALIBABA_TOKEN_PLAN_API_KEY",
+    "alibaba-token-plan-cn": "ALIBABA_TOKEN_PLAN_CN_API_KEY",
     "xiaomi": "XIAOMI_API_KEY",
     "nous": "NOUS_API_KEY",
 }
@@ -192,7 +198,11 @@ def _provider_labels() -> dict[str, str]:
         from hermes_cli.models_catalog_static import _PROVIDER_LABELS  # type: ignore
 
         labels = {str(k): str(v) for k, v in dict(_PROVIDER_LABELS).items()}
-        return labels or dict(_FALLBACK_LABELS)
+        if not labels:
+            labels = dict(_FALLBACK_LABELS)
+        labels["alibaba-token-plan"] = "QwenCloud Token Plan"
+        labels["alibaba-token-plan-cn"] = "QwenCloud Token Plan (China)"
+        return labels
     except Exception:  # noqa: BLE001
         log.debug("provider catalog unavailable, using fallback labels", exc_info=True)
         return dict(_FALLBACK_LABELS)
@@ -718,6 +728,49 @@ def _probe_deepseek() -> dict[str, Any]:
             "fetched_at": datetime.now(timezone.utc).isoformat()}
 
 
+def _probe_qwencloud_token_plan() -> dict[str, Any]:
+    """QwenCloud Token Plan Individual quota via a persistent browser session.
+
+    The inference API key and public BssOpenAPI surface do not expose Individual
+    Token Plan quota; the console API requires a logged-in browser session. The
+    bundled helper reuses a dedicated Playwright profile (qwencloud_login.py).
+    """
+    helper = Path(__file__).resolve().parent / "qwencloud_browser_probe.py"
+    if not helper.is_file():
+        return _unavailable("QwenCloud browser probe helper is missing.", source="qwencloud_console")
+    kwargs: dict[str, Any] = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        proc = subprocess.run([sys.executable, str(helper)], capture_output=True, text=True,
+                              timeout=90, **kwargs)
+    except Exception as exc:  # noqa: BLE001
+        return _unavailable(f"QwenCloud browser probe failed: {type(exc).__name__}: {exc}",
+                            source="qwencloud_console")
+    out = (proc.stdout or "").strip()
+    if not out:
+        return _unavailable(f"QwenCloud browser probe returned no data (exit {proc.returncode}).",
+                            source="qwencloud_console")
+    try:
+        data = json.loads(out.splitlines()[-1])
+    except Exception as exc:  # noqa: BLE001
+        return _unavailable(f"QwenCloud browser probe returned invalid JSON: {exc}",
+                            source="qwencloud_console")
+    if not data.get("available"):
+        return _unavailable(data.get("reason") or "QwenCloud quota unavailable.",
+                            source="qwencloud_console")
+    windows = [_window(w.get("label") or "Monthly", w.get("used_percent"),
+                       w.get("reset_at"), w.get("detail"))
+               for w in data.get("windows") or []]
+    windows = [w for w in windows if w.get("used_percent") is not None]
+    if not windows:
+        return _unavailable("QwenCloud returned no parseable quota windows.", source="qwencloud_console")
+    return {"available": True, "source": "qwencloud_console",
+            "title": data.get("title") or "QwenCloud Token Plan", "plan": data.get("plan"),
+            "windows": windows, "details": data.get("details") or [], "unavailable_reason": None,
+            "fetched_at": datetime.now(timezone.utc).isoformat()}
+
+
 _PROBES: dict[str, Callable[[], dict[str, Any]]] = {
     "anthropic": _probe_anthropic,
     "openai-codex": lambda: _probe_standard("openai-codex"),
@@ -730,6 +783,8 @@ _PROBES: dict[str, Callable[[], dict[str, Any]]] = {
     "kimi-coding": _probe_kimi,
     "minimax": _probe_minimax,
     "deepseek": _probe_deepseek,
+    "alibaba-token-plan": _probe_qwencloud_token_plan,
+    "alibaba-token-plan-cn": _probe_qwencloud_token_plan,
 }
 
 

@@ -41,10 +41,33 @@ the page, chip and sidebar without reinstalling the plugin.
 | `kimi-coding` | `api.kimi.com/coding/v1/usages` |
 | `minimax` | `api.minimax.io/v1/api/openplatform/coding_plan/remains` |
 | `deepseek` | `api.deepseek.com/user/balance` |
+| `alibaba-token-plan` | QwenCloud console (Individual Token Plan, browser session) |
 
 Providers with no quota API are listed with an explicit reason instead of a fabricated
 bar. Absence-path providers (Grok/SuperGrok, Gemini Code Assist OAuth, Cursor, Kiro) need
 browser cookies and are deliberately not attempted.
+
+### QwenCloud Token Plan (Individual)
+
+QwenCloud does **not** expose Individual Token Plan quota through the inference API key
+(`sk-sp-…`) or the public BssOpenAPI surface; the official `qwencloud` CLI also misses it
+on gray-flagged Individual accounts. The quota lives in the console API, which requires a
+logged-in browser session. This plugin therefore reads it through a dedicated Playwright
+profile:
+
+```bash
+# one-time interactive login (opens a browser window)
+python dashboard/qwencloud_login.py
+
+# headless quota snapshot used by the plugin
+python dashboard/qwencloud_browser_probe.py
+```
+
+The profile defaults to `D:/HermesCargo/qwencloud-session` when present, otherwise
+`~/.hermes/qwencloud-session`; override with `QWENCLOUD_BROWSER_PROFILE`. Requires
+`playwright` and a Chromium install (`playwright install chromium`). If the session
+expires, the card shows an explicit "run qwencloud_login.py again" reason instead of a
+stale or fabricated bar.
 
 ## Install
 
@@ -138,4 +161,5 @@ canonical plugin id.
 - Read-only. Nothing is written except the plugin's own cache and the two UI prefs.
 - Credentials are resolved in-process and **never serialized**; the wire carries
   `configured: true/false` and a source label only.
-- The only outbound calls are the provider quota endpoints above.
+- The only outbound calls are the provider quota endpoints above. The optional QwenCloud
+  probe reuses a local browser profile's login cookies; it never prints or serializes them.
